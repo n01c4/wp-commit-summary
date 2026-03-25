@@ -741,7 +741,7 @@ function startBot() {
         log("ERROR", "Cron", `runDailyReport YAKALANMAMIŞ HATA: ${err.message}`);
         log("ERROR", "Cron", err.stack);
       });
-    });
+    }, { timezone: "Europe/Istanbul" });
     log("INFO", "Bot", `Cron job aktif: ${CRON_SCHEDULE}`);
 
     // Periyodik health check
