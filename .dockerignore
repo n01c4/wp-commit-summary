@@ -1,0 +1,13 @@
+node_modules/
+.wwebjs_auth/
+.wwebjs_cache/
+.env
+.git/
+.gitignore
+.vscode/
+.idea/
+CLAUDE.md
+README.md
+Thumbs.db
+Desktop.ini
+.DS_Store
