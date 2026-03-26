@@ -403,6 +403,9 @@ function createClient() {
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--no-first-run",
+        "--disk-cache-size=1",
+        "--aggressive-cache-discard",
+        "--disable-gpu-shader-disk-cache",
       ],
     },
   });
