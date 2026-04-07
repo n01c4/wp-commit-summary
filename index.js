@@ -1,10 +1,6 @@
 require("dotenv").config();
-const { Client, LocalAuth } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
 const cron = require("node-cron");
 const axios = require("axios");
-const notifier = require("node-notifier");
-const path = require("path");
 
 // ─── Structured Logging ──────────────────────────────────
 function log(level, tag, msg) {
@@ -24,11 +20,17 @@ function log(level, tag, msg) {
 const {
   GITHUB_TOKEN,
   HF_API_TOKEN,
-  WHATSAPP_GROUP_NAME,
+  TELEGRAM_BOT_TOKEN,
+  TELEGRAM_CHAT_ID,
   REPOS,
   CRON_SCHEDULE = "30 6 * * *",
   SUMMARY_LANGUAGE = "tr",
 } = process.env;
+
+if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+  log("ERROR", "Bot", "TELEGRAM_BOT_TOKEN veya TELEGRAM_CHAT_ID .env'de tanımlı değil. Çıkılıyor.");
+  process.exit(1);
+}
 
 const repos = REPOS.split(",").map((r) => r.trim());
 const ghHeaders = {
@@ -37,37 +39,16 @@ const ghHeaders = {
 };
 
 // ─── Sabitler ─────────────────────────────────────────────
-const HEALTH_CHECK_INTERVAL_MS = 5 * 60 * 1000;     // 5 dakika
-const MAX_SEND_RETRIES = 3;                          // mesaj gönderim deneme sayısı
-const REINIT_TIMEOUT_MS = 90 * 1000;                 // reinit için max bekleme
-const RETRY_DELAY_MS = 10 * 1000;                    // denemeler arası bekleme
+const MAX_SEND_RETRIES = 3;                          // Telegram gönderim deneme sayısı
+const RETRY_DELAY_MS = 5 * 1000;                     // denemeler arası bekleme
 const GITHUB_RETRY_COUNT = 3;                        // GitHub API retry
 const GITHUB_RETRY_DELAY_MS = 5 * 1000;              // GitHub retry arası bekleme
 const HF_MAX_RETRIES = 3;                            // HF 503 retry limiti
-
-// ─── WhatsApp State ──────────────────────────────────────
-let whatsappClient = null;
-let cachedGroupId = null;
-let isReady = false;
-let isRecovering = false;
-let healthCheckTimer = null;
-let lastHealthCheckTime = null;
-let lastHealthCheckOk = null;
-let startupTime = null;
+const TELEGRAM_MAX_LEN = 4096;                       // Telegram mesaj karakter limiti
 
 // ─── Yardımcı: Gecikme ──────────────────────────────────
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-// ─── Yardımcı: Timeout ile Promise ──────────────────────
-function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`${label}: ${ms}ms timeout aşıldı`)), ms)
-    ),
-  ]);
 }
 
 // ─── GitHub: Son 24 saatteki commitleri çek ───────────────
@@ -360,7 +341,7 @@ function buildFallbackReport(allRepoData) {
   let report = "";
 
   for (const repoData of allRepoData) {
-    report += `📦 *${repoData.repo}*\n`;
+    report += `📦 ${repoData.repo}\n`;
     report += `📊 ${repoData.count} commit | ${repoData.totalFiles} dosya | +${repoData.totalAdditions} -${repoData.totalDeletions} satır\n`;
     report += `👥 ${repoData.authors}\n\n`;
 
@@ -372,8 +353,8 @@ function buildFallbackReport(allRepoData) {
         hour: "2-digit",
         minute: "2-digit",
       });
-      report += `• \`${c.sha}\` ${msgFirstLine}\n`;
-      report += `  _${c.author}_ (${date}) — ${c.files.length} dosya, +${c.stats.additions}/-${c.stats.deletions}\n`;
+      report += `• ${c.sha} ${msgFirstLine}\n`;
+      report += `  ${c.author} (${date}) — ${c.files.length} dosya, +${c.stats.additions}/-${c.stats.deletions}\n`;
 
       const newFiles = c.files.filter((f) => f.status === "added");
       if (newFiles.length) {
@@ -388,284 +369,74 @@ function buildFallbackReport(allRepoData) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ─── WhatsApp: Sağlam bağlantı yönetimi ─────────────────
+// ─── Telegram: Mesaj gönderim ───────────────────────────
 // ═══════════════════════════════════════════════════════════
 
-function createClient() {
-  log("INFO", "WhatsApp", "Yeni client oluşturuluyor...");
-  return new Client({
-    authStrategy: new LocalAuth({ dataPath: "./.wwebjs_auth" }),
-    puppeteer: {
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--no-first-run",
-        "--disk-cache-size=1",
-        "--aggressive-cache-discard",
-        "--disable-gpu-shader-disk-cache",
-      ],
-    },
-  });
-}
+// Mesajı 4096 karakter limitine göre satır sınırlarında parçala
+function splitMessage(text, maxLen = TELEGRAM_MAX_LEN) {
+  if (text.length <= maxLen) return [text];
 
-function attachClientEvents(client) {
-  client.on("qr", (qr) => {
-    log("INFO", "WhatsApp", "QR kodu oluşturuldu — telefon ile taranması bekleniyor.");
-    qrcode.generate(qr, { small: true });
-    notifier.notify({
-      title: "WhatsApp QR Kodu Gerekli",
-      message: "Terminali aç ve QR kodu telefonunla tara!",
-      sound: true,
-      wait: true,
-    });
-  });
+  const chunks = [];
+  let remaining = text;
 
-  client.on("loading_screen", (percent, message) => {
-    log("INFO", "WhatsApp", `Yükleniyor: %${percent} — ${message}`);
-  });
-
-  client.on("authenticated", () => {
-    log("INFO", "WhatsApp", "Oturum doğrulandı (session geçerli).");
-  });
-
-  client.on("ready", () => {
-    isReady = true;
-    isRecovering = false;
-    lastHealthCheckOk = new Date();
-    log("INFO", "WhatsApp", "=== BAĞLANTI HAZIR ===");
-    log("INFO", "WhatsApp", `Takip edilen repolar: ${repos.join(", ")}`);
-    log("INFO", "WhatsApp", `Cron: ${CRON_SCHEDULE}`);
-    log("INFO", "WhatsApp", `Grup: ${WHATSAPP_GROUP_NAME}`);
-  });
-
-  client.on("auth_failure", (msg) => {
-    isReady = false;
-    log("ERROR", "WhatsApp", `OTURUM HATASI: ${msg}`);
-    log("ERROR", "WhatsApp", "Kullanıcı telefonundan session silinmiş olabilir. QR kodu yeniden taranmalı.");
-    notifier.notify({
-      title: "WhatsApp Oturum Hatası",
-      message: "Oturum geçersiz! Terminali aç, QR kodu yeniden tara.",
-      sound: true,
-      wait: true,
-    });
-  });
-
-  client.on("disconnected", (reason) => {
-    isReady = false;
-    log("ERROR", "WhatsApp", `BAĞLANTI KOPTU: ${reason}`);
-    notifier.notify({
-      title: "WhatsApp Bağlantı Koptu",
-      message: `Sebep: ${reason}. Otomatik kurtarma başlayacak.`,
-      sound: true,
-      wait: true,
-    });
-    // disconnected sonrası recovery healthCheck tarafından yapılacak
-  });
-
-  client.on("change_state", (state) => {
-    log("INFO", "WhatsApp", `Durum değişikliği: ${state}`);
-  });
-}
-
-// ─── WhatsApp: Bağlantı sağlığını kontrol et ────────────
-async function healthCheck() {
-  const now = new Date();
-  lastHealthCheckTime = now;
-
-  if (isRecovering) {
-    log("INFO", "HealthCheck", "Recovery devam ediyor, kontrol atlanıyor.");
-    return;
-  }
-
-  try {
-    // getState() — Puppeteer frame'e erişir, bozuksa hata fırlatır
-    const state = await withTimeout(
-      whatsappClient.getState(),
-      15000,
-      "getState"
-    );
-    if (state === "CONNECTED") {
-      lastHealthCheckOk = now;
-      log("INFO", "HealthCheck", `OK — Durum: ${state} | Uptime: ${formatUptime()}`);
-    } else {
-      log("ERROR", "HealthCheck", `Beklenmeyen durum: ${state} — recovery başlatılıyor.`);
-      await recoverWhatsApp("healthCheck: beklenmeyen durum " + state);
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
     }
-  } catch (err) {
-    log("ERROR", "HealthCheck", `BAŞARISIZ: ${err.message}`);
-    const lastOkAgo = lastHealthCheckOk
-      ? `${Math.round((now - lastHealthCheckOk) / 1000)}sn önce`
-      : "hiç";
-    log("ERROR", "HealthCheck", `Son başarılı kontrol: ${lastOkAgo}`);
-    await recoverWhatsApp("healthCheck hatası: " + err.message);
+    // Önce çift newline (paragraph) sınırı dene
+    let cut = remaining.lastIndexOf("\n\n", maxLen);
+    if (cut < maxLen / 2) cut = remaining.lastIndexOf("\n", maxLen);
+    if (cut < maxLen / 2) cut = maxLen;
+    chunks.push(remaining.substring(0, cut).trimEnd());
+    remaining = remaining.substring(cut).replace(/^\s+/, "");
   }
+  return chunks;
 }
 
-function formatUptime() {
-  if (!startupTime) return "N/A";
-  const diff = Date.now() - startupTime;
-  const hours = Math.floor(diff / 3600000);
-  const mins = Math.floor((diff % 3600000) / 60000);
-  return `${hours}sa ${mins}dk`;
-}
+async function sendTelegramMessage(text) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  const chunks = splitMessage(text);
+  log("INFO", "Telegram", `Mesaj ${chunks.length} parçaya bölündü (toplam ${text.length} karakter).`);
 
-// ─── WhatsApp: Otomatik kurtarma ─────────────────────────
-async function recoverWhatsApp(reason) {
-  if (isRecovering) {
-    log("INFO", "Recovery", "Zaten recovery devam ediyor, tekrar başlatılmıyor.");
-    return;
-  }
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    let sent = false;
 
-  isRecovering = true;
-  isReady = false;
-  log("INFO", "Recovery", `=== RECOVERY BAŞLADI === Sebep: ${reason}`);
-
-  // 1) Eski client'ı yok et
-  try {
-    log("INFO", "Recovery", "Eski client destroy ediliyor...");
-    await withTimeout(whatsappClient.destroy(), 15000, "destroy");
-    log("INFO", "Recovery", "Eski client destroy edildi.");
-  } catch (err) {
-    log("ERROR", "Recovery", `Destroy hatası (önemsiz, devam ediliyor): ${err.message}`);
-  }
-
-  // 2) Yeni client oluştur ve başlat
-  log("INFO", "Recovery", "Yeni client oluşturuluyor...");
-  whatsappClient = createClient();
-  attachClientEvents(whatsappClient);
-
-  try {
-    await withTimeout(
-      new Promise((resolve, reject) => {
-        whatsappClient.once("ready", () => resolve());
-        whatsappClient.once("auth_failure", (msg) => reject(new Error("Auth hatası: " + msg)));
-        whatsappClient.initialize().catch(reject);
-      }),
-      REINIT_TIMEOUT_MS,
-      "Recovery init"
-    );
-    log("INFO", "Recovery", "=== RECOVERY BAŞARILI ===");
-  } catch (err) {
-    isRecovering = false;
-    log("ERROR", "Recovery", `Recovery başarısız: ${err.message} — sonraki healthCheck'te tekrar denenecek.`);
-  }
-}
-
-// ─── WhatsApp: Bağlantı hazır olana kadar bekle ─────────
-async function ensureWhatsAppReady() {
-  if (isReady) {
-    // Ek güvenlik: gerçekten çalışıyor mu kontrol et
-    try {
-      const state = await withTimeout(whatsappClient.getState(), 10000, "ensureReady-getState");
-      if (state === "CONNECTED") {
-        log("INFO", "WhatsApp", "ensureReady: Bağlantı doğrulandı (CONNECTED).");
-        return true;
-      }
-      log("ERROR", "WhatsApp", `ensureReady: Durum CONNECTED değil (${state}), recovery başlatılıyor.`);
-    } catch (err) {
-      log("ERROR", "WhatsApp", `ensureReady: getState hatası: ${err.message}, recovery başlatılıyor.`);
-    }
-    // Buraya düştüyse bağlantı aslında bozuk
-    await recoverWhatsApp("ensureReady: bağlantı doğrulanamadı");
-  }
-
-  if (!isReady) {
-    log("INFO", "WhatsApp", "ensureReady: Bağlantı hazır değil, recovery başlatılıyor...");
-    if (!isRecovering) {
-      await recoverWhatsApp("ensureReady: isReady=false");
-    } else {
-      // Recovery zaten çalışıyor, bitmesini bekle
-      log("INFO", "WhatsApp", "ensureReady: Recovery zaten çalışıyor, bitmesi bekleniyor...");
-      const waitStart = Date.now();
-      while (!isReady && Date.now() - waitStart < REINIT_TIMEOUT_MS) {
-        await delay(1000);
-      }
-    }
-  }
-
-  if (isReady) {
-    log("INFO", "WhatsApp", "ensureReady: Bağlantı hazır.");
-    return true;
-  }
-
-  log("ERROR", "WhatsApp", "ensureReady: Bağlantı sağlanamadı.");
-  return false;
-}
-
-// ─── WhatsApp: Mesaj gönder (agresif retry ile) ─────────
-async function sendWhatsAppMessage(message) {
-  for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
-    log("INFO", "Gönderim", `=== GÖNDERIM DENEMESİ ${attempt}/${MAX_SEND_RETRIES} ===`);
-
-    // Her denemede bağlantıyı doğrula
-    const ready = await ensureWhatsAppReady();
-    if (!ready) {
-      log("ERROR", "Gönderim", `Deneme ${attempt}: WhatsApp bağlantısı sağlanamadı.`);
-      if (attempt < MAX_SEND_RETRIES) {
-        log("INFO", "Gönderim", `${RETRY_DELAY_MS / 1000}sn sonra tekrar denenecek...`);
-        await delay(RETRY_DELAY_MS);
-      }
-      continue;
-    }
-
-    try {
-      let group;
-      if (cachedGroupId) {
-        log("INFO", "Gönderim", `Cache'den grup çekiliyor: ${cachedGroupId}`);
-        group = await withTimeout(whatsappClient.getChatById(cachedGroupId), 30000, "getChatById");
-      } else {
-        log("INFO", "Gönderim", "Chat listesi çekiliyor (ilk sefer)...");
-        const chats = await withTimeout(whatsappClient.getChats(), 120000, "getChats");
-        log("INFO", "Gönderim", `${chats.length} chat bulundu, grup aranıyor: "${WHATSAPP_GROUP_NAME}"`);
-        group = chats.find((c) => c.name === WHATSAPP_GROUP_NAME && c.isGroup);
-        if (!group) {
-          const groupNames = chats.filter((c) => c.isGroup).map((c) => c.name);
-          log("ERROR", "Gönderim", `GRUP BULUNAMADI: "${WHATSAPP_GROUP_NAME}"`);
-          log("ERROR", "Gönderim", `Mevcut gruplar (${groupNames.length}): ${groupNames.join(", ")}`);
-          return false;
+    for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
+      try {
+        log("INFO", "Telegram", `Parça ${i + 1}/${chunks.length} gönderiliyor (${chunk.length} karakter, deneme ${attempt}/${MAX_SEND_RETRIES})...`);
+        await axios.post(
+          url,
+          {
+            chat_id: TELEGRAM_CHAT_ID,
+            text: chunk,
+            disable_web_page_preview: true,
+          },
+          { timeout: 30000 }
+        );
+        log("INFO", "Telegram", `Parça ${i + 1}/${chunks.length} gönderildi.`);
+        sent = true;
+        break;
+      } catch (err) {
+        const desc = err.response?.data?.description || err.message;
+        const status = err.response?.status || "N/A";
+        log("ERROR", "Telegram", `Parça ${i + 1} deneme ${attempt} BAŞARISIZ: ${desc} (status: ${status})`);
+        if (attempt < MAX_SEND_RETRIES) {
+          log("INFO", "Telegram", `${RETRY_DELAY_MS / 1000}sn sonra tekrar denenecek...`);
+          await delay(RETRY_DELAY_MS);
         }
-        cachedGroupId = group.id._serialized;
-        log("INFO", "Gönderim", `Grup ID cache'lendi: ${cachedGroupId}`);
       }
+    }
 
-      log("INFO", "Gönderim", `Grup: "${group.name}" (${group.id._serialized}). Mesaj gönderiliyor (${message.length} karakter)...`);
-      await withTimeout(group.sendMessage(message), 30000, "sendMessage");
-      log("INFO", "Gönderim", `=== MESAJ BAŞARIYLA GÖNDERİLDİ === Grup: ${WHATSAPP_GROUP_NAME}`);
-      return true;
-    } catch (err) {
-      log("ERROR", "Gönderim", `Deneme ${attempt} BAŞARISIZ: ${err.message}`);
-
-      // Frame/session hataları — recovery yap
-      if (
-        err.message.includes("detached") ||
-        err.message.includes("frame") ||
-        err.message.includes("Target closed") ||
-        err.message.includes("Session closed") ||
-        err.message.includes("Protocol error") ||
-        err.message.includes("timeout")
-      ) {
-        log("INFO", "Gönderim", "Puppeteer/bağlantı hatası tespit edildi, recovery başlatılıyor...");
-        await recoverWhatsApp("sendMessage hatası: " + err.message);
-      }
-
-      if (attempt < MAX_SEND_RETRIES) {
-        log("INFO", "Gönderim", `${RETRY_DELAY_MS / 1000}sn sonra tekrar denenecek...`);
-        await delay(RETRY_DELAY_MS);
-      }
+    if (!sent) {
+      log("ERROR", "Telegram", `=== PARÇA ${i + 1}/${chunks.length} GÖNDERİLEMEDİ — RAPOR EKSİK KALDI ===`);
+      return false;
     }
   }
 
-  log("ERROR", "Gönderim", `=== TÜM DENEMELER BAŞARISIZ (${MAX_SEND_RETRIES}/${MAX_SEND_RETRIES}) === MESAJ GÖNDERİLEMEDİ!`);
-  notifier.notify({
-    title: "MESAJ GÖNDERİLEMEDİ!",
-    message: `${MAX_SEND_RETRIES} deneme sonrası mesaj gönderilemedi. Kontrol edin!`,
-    sound: true,
-    wait: true,
-  });
-  return false;
+  log("INFO", "Telegram", `=== TÜM MESAJ BAŞARIYLA GÖNDERİLDİ === chat_id: ${TELEGRAM_CHAT_ID}`);
+  return true;
 }
 
 // ─── Ana akış ─────────────────────────────────────────────
@@ -701,14 +472,14 @@ async function runDailyReport() {
     summary = buildFallbackReport(allRepoData);
   }
 
-  // 3) WhatsApp'a gönder
+  // 3) Telegram'a gönder
   const today = new Date().toLocaleDateString("tr-TR");
   const repoNames = allRepoData.map((d) => d.repo).join(", ");
-  const header = `🤖 *Günlük Commit Özeti*\n📅 ${today}\n📋 ${repoNames}\n${"─".repeat(30)}\n\n`;
+  const header = `🤖 Günlük Commit Özeti\n📅 ${today}\n📋 ${repoNames}\n${"─".repeat(30)}\n\n`;
   const message = header + summary;
 
   log("INFO", "Rapor", `Mesaj hazır (${message.length} karakter). Gönderiliyor...`);
-  const sent = await sendWhatsAppMessage(message);
+  const sent = await sendTelegramMessage(message);
 
   if (sent) {
     log("INFO", "Rapor", `=== RAPOR TAMAMLANDI === (id: ${reportId})`);
@@ -719,81 +490,46 @@ async function runDailyReport() {
 
 // ─── Başlatma ─────────────────────────────────────────────
 function startBot() {
-  startupTime = Date.now();
   log("INFO", "Bot", "═══════════════════════════════════════════");
-  log("INFO", "Bot", "      WhatsApp Commit Bot Başlatılıyor     ");
+  log("INFO", "Bot", "      Telegram Commit Bot Başlatılıyor     ");
   log("INFO", "Bot", "═══════════════════════════════════════════");
   log("INFO", "Bot", `Repolar: ${repos.join(", ")}`);
-  log("INFO", "Bot", `Cron: ${CRON_SCHEDULE}`);
-  log("INFO", "Bot", `Grup: ${WHATSAPP_GROUP_NAME}`);
+  log("INFO", "Bot", `Cron: ${CRON_SCHEDULE} (Europe/Istanbul)`);
+  log("INFO", "Bot", `Telegram chat_id: ${TELEGRAM_CHAT_ID}`);
   log("INFO", "Bot", `Dil: ${SUMMARY_LANGUAGE}`);
   log("INFO", "Bot", `HF Model: ${HF_MODEL}`);
-  log("INFO", "Bot", `Health check aralığı: ${HEALTH_CHECK_INTERVAL_MS / 1000}sn`);
   log("INFO", "Bot", `Gönderim retry: ${MAX_SEND_RETRIES} deneme`);
-  log("INFO", "Bot", `Recovery timeout: ${REINIT_TIMEOUT_MS / 1000}sn`);
 
-  whatsappClient = createClient();
-  attachClientEvents(whatsappClient);
+  // Cron job
+  cron.schedule(CRON_SCHEDULE, () => {
+    log("INFO", "Cron", "=== CRON TETİKLENDİ ===");
+    runDailyReport().catch((err) => {
+      log("ERROR", "Cron", `runDailyReport YAKALANMAMIŞ HATA: ${err.message}`);
+      log("ERROR", "Cron", err.stack);
+    });
+  }, { timezone: "Europe/Istanbul" });
+  log("INFO", "Bot", `Cron job aktif: ${CRON_SCHEDULE}`);
 
-  // İlk ready'de cron ve health check başlat
-  whatsappClient.once("ready", () => {
-    // Cron job
-    cron.schedule(CRON_SCHEDULE, () => {
-      log("INFO", "Cron", "=== CRON TETİKLENDİ ===");
-      runDailyReport().catch((err) => {
-        log("ERROR", "Cron", `runDailyReport YAKALANMAMIŞ HATA: ${err.message}`);
-        log("ERROR", "Cron", err.stack);
-      });
-    }, { timezone: "Europe/Istanbul" });
-    log("INFO", "Bot", `Cron job aktif: ${CRON_SCHEDULE}`);
-
-    // Periyodik health check
-    healthCheckTimer = setInterval(() => {
-      healthCheck().catch((err) => {
-        log("ERROR", "HealthCheck", `YAKALANMAMIŞ HATA: ${err.message}`);
-      });
-    }, HEALTH_CHECK_INTERVAL_MS);
-    log("INFO", "Bot", `Health check aktif: her ${HEALTH_CHECK_INTERVAL_MS / 60000} dakikada bir.`);
-
-    // Test modu
-    if (process.argv.includes("--test")) {
-      log("INFO", "Bot", "Test modu aktif — rapor 3sn sonra gönderilecek.");
-      setTimeout(() => {
-        runDailyReport().catch((err) => {
-          log("ERROR", "Test", `Test raporu hatası: ${err.message}`);
-          log("ERROR", "Test", err.stack);
-        });
-      }, 3000);
-    } else {
-      log("INFO", "Bot", "Cron beklemede. Test için: node index.js --test");
-    }
-  });
-
-  whatsappClient.initialize().catch((err) => {
-    log("ERROR", "Bot", `İlk başlatma hatası: ${err.message}`);
-    log("ERROR", "Bot", "5sn sonra tekrar denenecek...");
-    setTimeout(() => startBot(), 5000);
-  });
+  // Test modu
+  if (process.argv.includes("--test")) {
+    log("INFO", "Bot", "Test modu aktif — rapor hemen gönderilecek.");
+    runDailyReport().catch((err) => {
+      log("ERROR", "Test", `Test raporu hatası: ${err.message}`);
+      log("ERROR", "Test", err.stack);
+    });
+  } else {
+    log("INFO", "Bot", "Cron beklemede. Test için: node index.js --test");
+  }
 }
 
 // ─── Graceful shutdown ───────────────────────────────────
-process.on("SIGINT", async () => {
+process.on("SIGINT", () => {
   log("INFO", "Bot", "SIGINT alındı, kapatılıyor...");
-  if (healthCheckTimer) clearInterval(healthCheckTimer);
-  try {
-    await whatsappClient.destroy();
-    log("INFO", "Bot", "WhatsApp client kapatıldı.");
-  } catch (_) {}
   process.exit(0);
 });
 
-process.on("SIGTERM", async () => {
+process.on("SIGTERM", () => {
   log("INFO", "Bot", "SIGTERM alındı, kapatılıyor...");
-  if (healthCheckTimer) clearInterval(healthCheckTimer);
-  try {
-    await whatsappClient.destroy();
-    log("INFO", "Bot", "WhatsApp client kapatıldı.");
-  } catch (_) {}
   process.exit(0);
 });
 

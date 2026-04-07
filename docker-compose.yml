@@ -3,11 +3,4 @@ services:
     build: .
     env_file: .env
     restart: unless-stopped
-    mem_reservation: 64m
-    memswap_limit: -1
-    oom_score_adj: 1000
-    volumes:
-      - whatsapp_auth:/app/.wwebjs_auth
-
-volumes:
-  whatsapp_auth:
+    mem_reservation: 32m
