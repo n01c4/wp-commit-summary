@@ -51,6 +51,22 @@ function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// ─── Yardımcı: Telegram HTML escape / strip ─────────────
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function stripHtmlTags(s) {
+  return String(s)
+    .replace(/<\/?[a-zA-Z][^>]*>/g, "")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
 // ─── GitHub: Son 24 saatteki commitleri çek ───────────────
 async function getCommits(repo) {
   const since = new Date();
@@ -294,39 +310,53 @@ function buildMessages(allRepoData) {
       role: "system",
       content: `Sen bir kıdemli yazılım mühendisisin. Commit verilerinden ${lang} detaylı günlük rapor yaz.
 
-ÖNEMLİ KURALLAR:
-1. Her dosyayı tek tek listeleme! Bunun yerine değişiklikleri ANLAT ve açıkla. Dosyaları grupla ve ne amaçla eklendiğini/değiştiğini yaz.
-2. Anahtar dosyaları backtick içinde yaz ama her dosyayı değil, sadece önemli olanları.
+ÇIKTI FORMATI: TELEGRAM HTML. SADECE şu HTML tag'lerini kullan:
+- <b>kalın</b>
+- <i>italik</i>
+- <code>inline kod</code>
+
+KESİNLİKLE YASAK:
+- Markdown ASLA kullanma: **, ##, ###, ---, |, [], () dahil
+- HTML tablo, ul/li, h1-h6, br, p, div tag'leri YASAK
+- Yeni satır için sadece düz \\n karakteri kullan
+- Metnin içinde geçen < > & karakterlerini KULLANMA (HTML escape gerektirir, mesaj kırılır)
+
+İÇERİK KURALLARI:
+1. Her dosyayı tek tek listeleme! Değişiklikleri ANLAT, kategorize et, gruplandır.
+2. Önemli dosya adlarını <code>...</code> içine al, hepsini değil sadece anahtar olanları.
 3. Yeni eklenen büyük dosyalar için satır sayısını parantez içinde belirt.
-4. Değişiklikleri kategorize et: Veritabanı, Backend, Frontend, Test, UI vb.
+4. Değişiklikleri kategorize et: Veritabanı, Backend, Frontend, API, Test, UI, DevOps vb.
 
-FORMAT (her commit için):
+HER COMMIT İÇİN FORMAT:
 
-### \`{sha}\` — {ne yapıldığının kısa açıklaması}
-**Yazar:** {isim}
+<b>● {sha} — {kısa açıklama}</b>
+👤 <i>{yazar}</i>
 
-- **Kategori adı:** Anlatımsal açıklama. Önemli dosya adları ve satır sayıları inline olarak.
-- Birden fazla kategori varsa her birini ayrı madde yap.
+• <b>Kategori:</b> Anlatımsal açıklama. Önemli dosyalar inline <code>filename</code> şeklinde.
+• Birden fazla kategori varsa her birini ayrı satırda • ile madde yap.
 
 ÖRNEK ÇIKTI:
-### \`873961e\` — Excel export ve etkinlik menü navigasyon düzeltmeleri
-**Yazar:** poparticularly
 
-- **Yeni özellik — Excel Export:** \`org-orders-export.service.ts\` (710 satır) ile organizatörler için sipariş verilerini Excel'e aktarma özelliği eklendi. \`exceljs\` paketi bağımlılıklara eklendi.
-- **Frontend:** Organizatör panelinde \`EventList\` bileşeninde navigasyon düzeltmeleri yapıldı.
-- **API:** \`api.ts\` servis dosyasına export endpoint'leri eklendi.
+<b>● 873961e — Excel export ve etkinlik menü navigasyon düzeltmeleri</b>
+👤 <i>poparticularly</i>
 
-RAPORUN SONUNA EKLE:
+• <b>Yeni özellik — Excel Export:</b> <code>org-orders-export.service.ts</code> (710 satır) ile organizatörler için sipariş verilerini Excel'e aktarma eklendi. <code>exceljs</code> paketi bağımlılıklara eklendi.
+• <b>Frontend:</b> Organizatör panelinde <code>EventList</code> bileşeninde navigasyon düzeltmeleri yapıldı.
+• <b>API:</b> <code>api.ts</code> servis dosyasına export endpoint'leri eklendi.
 
-## Özet İstatistikler
-| Metrik | Değer |
-|--------|-------|
-(toplam commit, değişen dosya, eklenen/silinen satır, katkıda bulunanlar)
+RAPORUN SONUNA TABLO DEĞİL, MADDE LİSTESİ EKLE:
 
-## Eklenen Temel Özellikler
-| Özellik | Durum |
-|---------|-------|
-(her önemli özellik: ✅ Yeni / 🔄 Güncelleme / 🐛 Düzeltme)`,
+<b>📊 ÖZET İSTATİSTİKLER</b>
+• Toplam commit: X
+• Değişen dosya: Y
+• Eklenen satır: +A
+• Silinen satır: -B
+• Katkıda bulunanlar: ...
+
+<b>✨ EKLENEN TEMEL ÖZELLİKLER</b>
+• ✅ {yeni özellik}
+• 🔄 {güncelleme}
+• 🐛 {düzeltme}`,
     },
     {
       role: "user",
@@ -335,15 +365,15 @@ RAPORUN SONUNA EKLE:
   ];
 }
 
-// ─── Fallback: AI olmadan detaylı rapor ───────────────────
+// ─── Fallback: AI olmadan detaylı rapor (Telegram HTML) ──
 function buildFallbackReport(allRepoData) {
   log("INFO", "Fallback", "Ham veri raporu oluşturuluyor...");
   let report = "";
 
   for (const repoData of allRepoData) {
-    report += `📦 ${repoData.repo}\n`;
+    report += `📦 <b>${escapeHtml(repoData.repo)}</b>\n`;
     report += `📊 ${repoData.count} commit | ${repoData.totalFiles} dosya | +${repoData.totalAdditions} -${repoData.totalDeletions} satır\n`;
-    report += `👥 ${repoData.authors}\n\n`;
+    report += `👥 ${escapeHtml(repoData.authors)}\n\n`;
 
     for (const c of repoData.commits) {
       const msgFirstLine = c.message.split("\n")[0];
@@ -353,12 +383,12 @@ function buildFallbackReport(allRepoData) {
         hour: "2-digit",
         minute: "2-digit",
       });
-      report += `• ${c.sha} ${msgFirstLine}\n`;
-      report += `  ${c.author} (${date}) — ${c.files.length} dosya, +${c.stats.additions}/-${c.stats.deletions}\n`;
+      report += `• <code>${c.sha}</code> ${escapeHtml(msgFirstLine)}\n`;
+      report += `  <i>${escapeHtml(c.author)}</i> (${date}) — ${c.files.length} dosya, +${c.stats.additions}/-${c.stats.deletions}\n`;
 
       const newFiles = c.files.filter((f) => f.status === "added");
       if (newFiles.length) {
-        report += `  Yeni: ${newFiles.map((f) => f.name.split("/").pop()).join(", ")}\n`;
+        report += `  Yeni: ${escapeHtml(newFiles.map((f) => f.name.split("/").pop()).join(", "))}\n`;
       }
       report += "\n";
     }
@@ -394,10 +424,10 @@ function splitMessage(text, maxLen = TELEGRAM_MAX_LEN) {
   return chunks;
 }
 
-async function sendTelegramMessage(text) {
+async function sendTelegramMessage(text, parseMode = "HTML") {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   const chunks = splitMessage(text);
-  log("INFO", "Telegram", `Mesaj ${chunks.length} parçaya bölündü (toplam ${text.length} karakter).`);
+  log("INFO", "Telegram", `Mesaj ${chunks.length} parçaya bölündü (toplam ${text.length} karakter, parse_mode=${parseMode || "none"}).`);
 
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
@@ -406,15 +436,13 @@ async function sendTelegramMessage(text) {
     for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
       try {
         log("INFO", "Telegram", `Parça ${i + 1}/${chunks.length} gönderiliyor (${chunk.length} karakter, deneme ${attempt}/${MAX_SEND_RETRIES})...`);
-        await axios.post(
-          url,
-          {
-            chat_id: TELEGRAM_CHAT_ID,
-            text: chunk,
-            disable_web_page_preview: true,
-          },
-          { timeout: 30000 }
-        );
+        const payload = {
+          chat_id: TELEGRAM_CHAT_ID,
+          text: chunk,
+          disable_web_page_preview: true,
+        };
+        if (parseMode) payload.parse_mode = parseMode;
+        await axios.post(url, payload, { timeout: 30000 });
         log("INFO", "Telegram", `Parça ${i + 1}/${chunks.length} gönderildi.`);
         sent = true;
         break;
@@ -422,6 +450,13 @@ async function sendTelegramMessage(text) {
         const desc = err.response?.data?.description || err.message;
         const status = err.response?.status || "N/A";
         log("ERROR", "Telegram", `Parça ${i + 1} deneme ${attempt} BAŞARISIZ: ${desc} (status: ${status})`);
+
+        // HTML parse hatası → tüm mesajı strip edip plain text olarak baştan dene
+        if (parseMode === "HTML" && status === 400) {
+          log("INFO", "Telegram", "HTML parse hatası tespit edildi — tag'ler temizlenip plain text olarak yeniden gönderilecek.");
+          return await sendTelegramMessage(stripHtmlTags(text), null);
+        }
+
         if (attempt < MAX_SEND_RETRIES) {
           log("INFO", "Telegram", `${RETRY_DELAY_MS / 1000}sn sonra tekrar denenecek...`);
           await delay(RETRY_DELAY_MS);
@@ -475,7 +510,7 @@ async function runDailyReport() {
   // 3) Telegram'a gönder
   const today = new Date().toLocaleDateString("tr-TR");
   const repoNames = allRepoData.map((d) => d.repo).join(", ");
-  const header = `🤖 Günlük Commit Özeti\n📅 ${today}\n📋 ${repoNames}\n${"─".repeat(30)}\n\n`;
+  const header = `🤖 <b>Günlük Commit Özeti</b>\n📅 ${today}\n📋 ${escapeHtml(repoNames)}\n${"─".repeat(30)}\n\n`;
   const message = header + summary;
 
   log("INFO", "Rapor", `Mesaj hazır (${message.length} karakter). Gönderiliyor...`);

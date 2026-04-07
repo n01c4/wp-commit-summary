@@ -58,4 +58,4 @@ docker compose logs -f
 - Merge commits are excluded to avoid double-counting (child commits already contain the changes)
 - The LLM prompt instructs categorized narrative output, not raw file lists
 - If the HF model is cold (503), the bot retries automatically after 30s
-- Messages are sent as plain text (no `parse_mode`) — markdown symbols from the LLM appear literally but remain readable
+- Messages are sent with `parse_mode=HTML`; the LLM is instructed to emit only `<b>`, `<i>`, `<code>` tags. On parse errors, the bot strips tags and re-sends as plain text so the report still arrives

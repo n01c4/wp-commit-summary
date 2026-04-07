@@ -31,7 +31,8 @@ Single-file app (`index.js`) with this flow:
 Key design decisions:
 - Merge commits are detected (>1 parent) and excluded from detail fetching/final output to avoid double-counting
 - The LLM system prompt explicitly forbids listing every file — it must narrate and categorize changes
-- Telegram messages are sent as **plain text** (no `parse_mode`). The LLM emits markdown (`**bold**`, `### headings`, tables) which appears literally in Telegram but stays readable. Switching to `parse_mode=HTML` is the next step if formatting matters.
+- Telegram messages are sent with `parse_mode=HTML`. The HF system prompt instructs the model to emit only `<b>`, `<i>`, `<code>` tags (no markdown, no tables, no `<ul>/<li>`). If Telegram returns a 400 (parse error), `sendTelegramMessage` strips all tags via `stripHtmlTags()` and re-sends as plain text — the report still goes through, just less pretty.
+- Helper `escapeHtml()` is used in the fallback report and the header to safely embed user/repo/author strings that might contain `< > &`.
 
 ## Environment Variables
 
