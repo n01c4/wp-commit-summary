@@ -19,7 +19,7 @@ function log(level, tag, msg) {
 // ─── Config ───────────────────────────────────────────────
 const {
   GITHUB_TOKEN,
-  HF_API_TOKEN,
+  GROQ_API_KEY,
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   REPOS,
@@ -43,7 +43,7 @@ const MAX_SEND_RETRIES = 3;                          // Telegram gönderim denem
 const RETRY_DELAY_MS = 5 * 1000;                     // denemeler arası bekleme
 const GITHUB_RETRY_COUNT = 3;                        // GitHub API retry
 const GITHUB_RETRY_DELAY_MS = 5 * 1000;              // GitHub retry arası bekleme
-const HF_MAX_RETRIES = 3;                            // HF 503 retry limiti
+const GROQ_MAX_RETRIES = 2;                          // Groq 429/503 retry limiti (model başına)
 const TELEGRAM_MAX_LEN = 4096;                       // Telegram mesaj karakter limiti
 
 // ─── Yardımcı: Gecikme ──────────────────────────────────
@@ -252,45 +252,63 @@ function buildCommitText(repoData) {
   return text;
 }
 
-// ─── HF Inference API ile özet oluştur ────────────────────
-const HF_MODEL = "Qwen/Qwen3-235B-A22B";
+// ─── Groq API ile özet oluştur ────────────────────────────
+// Birincil: Kimi K2 (Türkçe ve narrative kalitesi yüksek, Qwen3 davranışına yakın)
+// Yedek:    Llama 3.3 70B (Groq'ta her zaman erişilebilir, aynı API key)
+const GROQ_PRIMARY_MODEL = "moonshotai/kimi-k2-instruct";
+const GROQ_FALLBACK_MODEL = "llama-3.3-70b-versatile";
+const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 
-async function generateSummary(allRepoData, retryCount = 0) {
-  const messages = buildMessages(allRepoData);
-
-  log("INFO", "HF", `Özet oluşturuluyor (model: ${HF_MODEL}, deneme: ${retryCount + 1}/${HF_MAX_RETRIES + 1})...`);
+async function callGroq(model, messages, retryCount = 0) {
+  log("INFO", "Groq", `Özet oluşturuluyor (model: ${model}, deneme: ${retryCount + 1}/${GROQ_MAX_RETRIES + 1})...`);
 
   try {
     const { data } = await axios.post(
-      "https://router.huggingface.co/v1/chat/completions",
+      GROQ_ENDPOINT,
       {
-        model: HF_MODEL,
+        model,
         messages,
         max_tokens: 4096,
         temperature: 0.3,
       },
       {
-        headers: { Authorization: `Bearer ${HF_API_TOKEN}` },
+        headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
         timeout: 120000,
       }
     );
 
     if (data.choices?.[0]?.message?.content) {
       const content = data.choices[0].message.content.trim();
-      log("INFO", "HF", `Özet başarıyla oluşturuldu (${content.length} karakter).`);
+      log("INFO", "Groq", `Özet başarıyla oluşturuldu (${content.length} karakter, model: ${model}).`);
       return content;
     }
-    log("ERROR", "HF", `Beklenmeyen yanıt: ${JSON.stringify(data).slice(0, 300)}`);
+    log("ERROR", "Groq", `Beklenmeyen yanıt (${model}): ${JSON.stringify(data).slice(0, 300)}`);
     return null;
   } catch (err) {
-    if (err.response?.status === 503 && retryCount < HF_MAX_RETRIES) {
-      log("INFO", "HF", `Model yükleniyor (503), 30sn sonra tekrar denenecek (deneme ${retryCount + 1}/${HF_MAX_RETRIES})...`);
-      await delay(30000);
-      return generateSummary(allRepoData, retryCount + 1);
+    const status = err.response?.status;
+    // 429 (rate limit) ve 503 (servis dolu) → kısa beklemeyle tekrar dene
+    if ((status === 429 || status === 503) && retryCount < GROQ_MAX_RETRIES) {
+      const wait = status === 429 ? 60000 : 10000;
+      log("INFO", "Groq", `${status} alındı (${model}), ${wait / 1000}sn sonra tekrar denenecek...`);
+      await delay(wait);
+      return callGroq(model, messages, retryCount + 1);
     }
-    log("ERROR", "HF", `Hata: ${err.message} (status: ${err.response?.status || "N/A"})`);
+    log("ERROR", "Groq", `Hata (${model}): ${err.message} (status: ${status || "N/A"})`);
     return null;
   }
+}
+
+async function generateSummary(allRepoData) {
+  const messages = buildMessages(allRepoData);
+
+  // 1) Birincil model: Kimi K2
+  const primary = await callGroq(GROQ_PRIMARY_MODEL, messages);
+  if (primary) return primary;
+
+  // 2) Yedek model: Llama 3.3 70B (aynı API key, ücretsiz, sıfır maliyet)
+  log("INFO", "Groq", `Birincil model (${GROQ_PRIMARY_MODEL}) başarısız, yedek modele geçiliyor: ${GROQ_FALLBACK_MODEL}`);
+  const fallback = await callGroq(GROQ_FALLBACK_MODEL, messages);
+  return fallback;
 }
 
 function buildMessages(allRepoData) {
@@ -499,11 +517,11 @@ async function runDailyReport() {
   const totalCommits = allRepoData.reduce((s, d) => s + d.count, 0);
   log("INFO", "Rapor", `Toplam ${totalCommits} commit bulundu (${allRepoData.length} repo). Özet oluşturuluyor...`);
 
-  // 2) HF ile özet oluştur
+  // 2) Groq ile özet oluştur (Kimi K2 → Llama 3.3 70B fallback)
   let summary = await generateSummary(allRepoData);
 
   if (!summary) {
-    log("INFO", "Rapor", "HF özeti oluşturulamadı, fallback rapor kullanılacak.");
+    log("INFO", "Rapor", "Groq özeti oluşturulamadı, ham veri raporu kullanılacak.");
     summary = buildFallbackReport(allRepoData);
   }
 
@@ -532,7 +550,8 @@ function startBot() {
   log("INFO", "Bot", `Cron: ${CRON_SCHEDULE} (Europe/Istanbul)`);
   log("INFO", "Bot", `Telegram chat_id: ${TELEGRAM_CHAT_ID}`);
   log("INFO", "Bot", `Dil: ${SUMMARY_LANGUAGE}`);
-  log("INFO", "Bot", `HF Model: ${HF_MODEL}`);
+  log("INFO", "Bot", `Groq birincil model: ${GROQ_PRIMARY_MODEL}`);
+  log("INFO", "Bot", `Groq yedek model:    ${GROQ_FALLBACK_MODEL}`);
   log("INFO", "Bot", `Gönderim retry: ${MAX_SEND_RETRIES} deneme`);
 
   // Cron job
